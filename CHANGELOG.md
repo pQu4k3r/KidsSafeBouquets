@@ -15,6 +15,7 @@
 - Added the missing `plugin.png`, `logo.png` and `main_bg.png` graphics.
 - Removed unused imports (`getPrevAsciiCode` is missing on some images).
 - Added IPK `postrm` script.
+- Added update check: when the plugin opens it checks for a newer release and offers to install it (can be disabled in Settings, or run from the menu with "Check for updates").
 
 ## v1.6
 

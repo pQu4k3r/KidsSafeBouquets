@@ -25,7 +25,11 @@ from Screens.Screen import Screen
 from . import _
 
 PLUGIN_NAME = "KidsSafe Bouquets"
+# Keep in sync with "Version:" in CONTROL/control (the release workflow checks it).
 PLUGIN_VERSION = "1.7"
+PACKAGE_NAME = "enigma2-plugin-extensions-kidssafebouquets"
+UPDATE_REPO = "dorinelu/KidsSafeBouquets"
+UPDATE_CONTROL_URL = "https://raw.githubusercontent.com/%s/main/CONTROL/control" % UPDATE_REPO
 PLUGIN_PATH = os.path.dirname(os.path.abspath(__file__))
 PY3 = sys.version_info[0] >= 3
 ENIGMA2_DIR = "/etc/enigma2"
@@ -126,6 +130,10 @@ config.plugins.kidssafebouquets.scan_channels = ConfigYesNo(default=True)
 config.plugins.kidssafebouquets.strict_hide = ConfigYesNo(default=True)
 config.plugins.kidssafebouquets.use_parental_control = ConfigYesNo(default=True)
 config.plugins.kidssafebouquets.make_backup = ConfigYesNo(default=True)
+config.plugins.kidssafebouquets.check_updates = ConfigYesNo(default=True)
+
+# Versions the user already answered "later" for during this GUI session.
+_update_prompted = set()
 
 
 def log(msg):
@@ -838,6 +846,66 @@ def apply_clean(scan_result):
     return (removed_bouquets, removed_sections, removed_section_services,
             removed_channels, hidden, protected, failures)
 
+def version_tuple(value):
+    """'1.8-r0' -> (1, 8). The package revision is ignored."""
+    value = re.sub(r"-r\d+$", "", (value or "").strip())
+    return tuple(int(x) for x in re.findall(r"\d+", value))
+
+
+def fetch_url(url, timeout=10):
+    try:
+        from urllib.request import Request, urlopen
+    except ImportError:
+        from urllib2 import Request, urlopen
+    request = Request(url, headers={"User-Agent": "KidsSafeBouquets/%s" % PLUGIN_VERSION})
+    try:
+        return urlopen(request, timeout=timeout).read()
+    except Exception as err:
+        # Some images ship without CA certificates; retry without verification.
+        if "CERTIFICATE" not in str(err).upper():
+            raise
+        import ssl
+        return urlopen(request, timeout=timeout, context=ssl._create_unverified_context()).read()
+
+
+def latest_version():
+    """Return the version published on the main branch, e.g. '1.8-r0'."""
+    data = fetch_url(UPDATE_CONTROL_URL)
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "ignore")
+    for line in data.splitlines():
+        if line.startswith("Version:"):
+            return line.split(":", 1)[1].strip()
+    raise ValueError("No version found in %s" % UPDATE_CONTROL_URL)
+
+
+def update_available(remote_version):
+    return version_tuple(remote_version) > version_tuple(PLUGIN_VERSION)
+
+
+def update_command(remote_version):
+    """Shell command that downloads and installs the released package."""
+    use_deb = os.path.exists("/var/lib/dpkg/status")
+    ext = "deb" if use_deb else "ipk"
+    tag = "v" + re.sub(r"-r0$", "", remote_version)
+    filename = "%s_%s_all.%s" % (PACKAGE_NAME, remote_version, ext)
+    url = "https://github.com/%s/releases/download/%s/%s" % (UPDATE_REPO, tag, filename)
+    dest = "/tmp/" + filename
+    download = (
+        'wget -q --no-check-certificate "{u}" -O "{d}" 2>/dev/null || '
+        'wget -q "{u}" -O "{d}" 2>/dev/null || '
+        'curl -fsSL -k "{u}" -o "{d}"'
+    ).format(u=url, d=dest)
+    if use_deb:
+        install = 'dpkg -i --force-overwrite "%s"' % dest
+    else:
+        install = 'opkg install --force-reinstall --force-overwrite "%s"' % dest
+    return ('echo "Downloading {f} ..."; rm -f "{d}"; '
+            '({dl}) && {inst}; rc=$?; rm -f "{d}"; '
+            '[ $rc -eq 0 ] && echo "Update installed." || echo "Update failed (code $rc)."; '
+            'exit $rc').format(f=filename, d=dest, dl=download, inst=install)
+
+
 def format_scan(result, title="Preview"):
     lines = ["%s - %s v%s" % (title, PLUGIN_NAME, PLUGIN_VERSION), ""]
     lines.append(_("Adult bouquets found: %d") % len(result["bouquets"]))
@@ -905,6 +973,7 @@ class KidsSafeSettings(Screen, ConfigListScreen):
             getConfigListEntry(_("Strict Kids Mode: hide matches from ALL / Satellites / Providers"), config.plugins.kidssafebouquets.strict_hide),
             getConfigListEntry(_("Also add matches to native parental blacklist"), config.plugins.kidssafebouquets.use_parental_control),
             getConfigListEntry(_("Create backup before cleaning"), config.plugins.kidssafebouquets.make_backup),
+            getConfigListEntry(_("Check for updates when the plugin opens"), config.plugins.kidssafebouquets.check_updates),
         ]
         ConfigListScreen.__init__(self, entries, session=session)
         self["header"] = Label(_("KidsSafe Bouquets v%s") % PLUGIN_VERSION)
@@ -930,7 +999,7 @@ class KidsSafeMain(Screen):
             <ePixmap pixmap="@PLUGIN_PATH@/logo.png" position="28,24" size="150,112" alphatest="blend" />
             <widget name="title" position="205,24" size="570,54" font="Regular;42" foregroundColor="#FFFFFF" transparent="1" />
             <widget name="subtitle" position="205,80" size="570,38" font="Regular;27" foregroundColor="#58AFFF" transparent="1" />
-            <widget name="list" position="32,175" size="570,300" font="Regular;29" itemHeight="56" scrollbarMode="showNever" transparent="1" />
+            <widget name="list" position="32,175" size="570,300" font="Regular;29" itemHeight="50" scrollbarMode="showNever" transparent="1" />
             <widget name="panelTitle" position="675,115" size="470,45" font="Regular;33" foregroundColor="#FFFFFF" transparent="1" />
             <widget name="version" position="675,162" size="470,38" font="Regular;28" foregroundColor="#58AFFF" transparent="1" />
             <widget name="panelText" position="675,214" size="470,245" font="Regular;22" foregroundColor="#E3EDF7" transparent="1" />
@@ -954,6 +1023,15 @@ class KidsSafeMain(Screen):
         except AttributeError:
             self.pendingTimer.callback.append(self.runPending)
         self.onClose.append(self.pendingTimer.stop)
+        self.updateResult = None
+        self.updateManual = False
+        self.updateChecking = False
+        self.updateTimer = eTimer()
+        try:
+            self.updateTimer_conn = self.updateTimer.timeout.connect(self.pollUpdateCheck)
+        except AttributeError:
+            self.updateTimer.callback.append(self.pollUpdateCheck)
+        self.onClose.append(self.updateTimer.stop)
         self["title"] = Label("KidsSafe Bouquets")
         self["subtitle"] = Label(_("A safer TV for your family"))
         self.menu = [
@@ -961,7 +1039,8 @@ class KidsSafeMain(Screen):
             (_("2   Preview scan"), "preview"),
             (_("3   Settings"), "settings"),
             (_("4   Restore last backup"), "restore"),
-            (_("5   About"), "about"),
+            (_("5   Check for updates"), "update"),
+            (_("6   About"), "about"),
         ]
         self["list"] = MenuList([x[0] for x in self.menu])
         self["panelTitle"] = Label("KidsSafe Bouquets")
@@ -987,6 +1066,76 @@ class KidsSafeMain(Screen):
             "up": self["list"].up, "down": self["list"].down,
             "left": self["list"].pageUp, "right": self["list"].pageDown,
         }, -1)
+        if config.plugins.kidssafebouquets.check_updates.value:
+            self.onFirstExecBegin.append(self.startUpdateCheck)
+
+    def startUpdateCheck(self, manual=False):
+        if self.updateChecking:
+            return
+        self.updateChecking = True
+        self.updateManual = manual
+        self.updateResult = None
+        if manual:
+            self["status"].setText(_("Checking for updates..."))
+
+        def worker():
+            try:
+                self.updateResult = ("ok", latest_version())
+            except Exception as err:
+                self.updateResult = ("error", str(err))
+
+        import threading
+        thread = threading.Thread(target=worker)
+        thread.daemon = True
+        thread.start()
+        self.updateTimer.start(300, False)
+
+    def pollUpdateCheck(self):
+        if self.updateResult is None:
+            return
+        self.updateTimer.stop()
+        self.updateChecking = False
+        status, value = self.updateResult
+        if status != "ok":
+            log("Update check failed: %s" % value)
+            if self.updateManual:
+                self["status"].setText(_("Update check failed."))
+                self.session.open(MessageBox, _("Could not check for updates:\n%s") % value, MessageBox.TYPE_ERROR)
+            return
+        if not update_available(value):
+            if self.updateManual:
+                self["status"].setText(_("KidsSafe Bouquets is up to date."))
+                self.session.open(MessageBox, _("You have the latest version (%s).") % PLUGIN_VERSION, MessageBox.TYPE_INFO, timeout=5)
+            return
+        self["status"].setText(_("Update available: version %s (installed %s).") % (value, PLUGIN_VERSION))
+        # Do not pop up over another dialog, and only ask once per version.
+        if not self.updateManual and (value in _update_prompted or self.session.current_dialog is not self):
+            return
+        _update_prompted.add(value)
+        self.session.openWithCallback(
+            lambda answer: self.updateConfirmed(answer, value), MessageBox,
+            _("A new version of KidsSafe Bouquets is available.\n\nInstalled: %s\nAvailable: %s\n\nInstall it now?") % (PLUGIN_VERSION, value),
+            MessageBox.TYPE_YESNO)
+
+    def updateConfirmed(self, answer, version):
+        if not answer:
+            return
+        from Screens.Console import Console
+        self.session.openWithCallback(
+            self.updateFinished, Console,
+            title=_("Updating KidsSafe Bouquets to %s") % version,
+            cmdlist=[update_command(version)], closeOnSuccess=False)
+
+    def updateFinished(self, *args):
+        self.session.openWithCallback(
+            self.restartGui, MessageBox,
+            _("The Enigma2 GUI must be restarted to load the new version.\n\nRestart now?"),
+            MessageBox.TYPE_YESNO)
+
+    def restartGui(self, answer):
+        if answer:
+            from Screens.Standby import TryQuitMainloop
+            self.session.open(TryQuitMainloop, 3)
 
     def settingsFingerprint(self):
         parts = []
@@ -1024,6 +1173,8 @@ class KidsSafeMain(Screen):
             self.openSettings()
         elif action == "restore":
             self.restoreLatest()
+        elif action == "update":
+            self.startUpdateCheck(manual=True)
         elif action == "about":
             self.showAbout()
 

@@ -87,6 +87,8 @@ A fresh installation can install v1.7 directly. Earlier versions are not require
 
 When the version in `CONTROL/control` changes on `main`, GitHub Actions builds the `.ipk` (OE) and `.deb` (DreamOS) packages and publishes them as a GitHub Release. The workflow can also be started manually from the Actions tab.
 
+For a new release, update both `PLUGIN_VERSION` in `plugin.py` and `Version:` in `CONTROL/control` (the workflow stops if they differ), and add a `## vX.Y` section to `CHANGELOG.md` for the release notes.
+
 The latest packages are always available at fixed links:
 
 ```text
@@ -109,6 +111,10 @@ to:
 ```
 
 on the receiver, then restart Enigma2.
+
+## Updates
+
+When the plugin opens, it checks in the background whether a newer version has been released. If there is one, it offers to download and install it; restart the GUI afterwards. The check can also be run from the menu (**Check for updates**) and can be switched off in **Settings**.
 
 ## Usage
 
