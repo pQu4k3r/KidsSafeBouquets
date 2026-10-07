@@ -83,6 +83,17 @@ Then restart the Enigma2 GUI.
 
 A fresh installation can install v1.7 directly. Earlier versions are not required.
 
+### Release packages
+
+When the version in `CONTROL/control` changes on `main`, GitHub Actions builds the `.ipk` (OE) and `.deb` (DreamOS) packages and publishes them as a GitHub Release. The workflow can also be started manually from the Actions tab.
+
+The latest packages are always available at fixed links:
+
+```text
+https://github.com/dorinelu/KidsSafeBouquets/releases/latest/download/enigma2-plugin-extensions-kidssafebouquets_all.ipk
+https://github.com/dorinelu/KidsSafeBouquets/releases/latest/download/enigma2-plugin-extensions-kidssafebouquets_all.deb
+```
+
 ### Manual source installation
 
 Copy:
