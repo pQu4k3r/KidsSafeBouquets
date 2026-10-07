@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
+import fnmatch
 import glob
 import os
 import re
+import sys
 import tarfile
 import time
 import unicodedata
 
-from enigma import eDVBDB, eServiceCenter, eServiceReference, getPrevAsciiCode
-from Components.ActionMap import ActionMap, NumberActionMap
+from enigma import eDVBDB, eServiceCenter, eServiceReference, eTimer
+from Components.ActionMap import ActionMap
 from Components.ConfigList import ConfigListScreen
 from Components.Label import Label
-from Components.Input import Input
 from Components.MenuList import MenuList
 from Components.ScrollLabel import ScrollLabel
 from Components.Sources.StaticText import StaticText
@@ -24,12 +25,17 @@ from Screens.Screen import Screen
 from . import _
 
 PLUGIN_NAME = "KidsSafe Bouquets"
-PLUGIN_VERSION = "1.6"
+PLUGIN_VERSION = "1.7"
+PLUGIN_PATH = os.path.dirname(os.path.abspath(__file__))
+PY3 = sys.version_info[0] >= 3
 ENIGMA2_DIR = "/etc/enigma2"
-CUSTOM_BLACKLIST = os.path.join(ENIGMA2_DIR, "kidssafe_blacklist.txt")
-CUSTOM_WHITELIST = os.path.join(ENIGMA2_DIR, "kidssafe_whitelist.txt")
 HIDDEN_REFS_FILE = os.path.join(ENIGMA2_DIR, "kidssafe_hidden_refs.txt")
 BACKUP_DIR = os.path.join(ENIGMA2_DIR, "kidssafe_backup")
+BACKUP_PATTERNS = [
+    "bouquets.tv", "bouquets.radio", "userbouquet.*.tv", "userbouquet.*.radio",
+    "kidssafe_hidden_refs.txt",
+    "blacklist",
+]
 
 # Aggressive family-safety rules. Whitelist always wins.
 # These terms are used for complete bouquets AND for section/marker headings.
@@ -129,11 +135,20 @@ def log(msg):
 def normalized(text):
     if text is None:
         return ""
-    try:
-        text = str(text)
-    except Exception:
-        return ""
-    text = text.replace("\u0086", "").replace("\u0087", "")
+    if PY3:
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "ignore")
+        else:
+            text = str(text)
+    else:
+        # Python 2 images return UTF-8 byte strings; work on unicode so that
+        # accent stripping and the non-ASCII rule terms below behave correctly.
+        try:
+            if not isinstance(text, unicode):  # noqa: F821
+                text = str(text).decode("utf-8", "ignore")
+        except Exception:
+            return ""
+    text = text.replace(u"\u0086", u"").replace(u"\u0087", u"")
     text = text.lower()
     # Accent-insensitive matching helps with Polish/French/Romanian/etc. settings.
     try:
@@ -142,10 +157,9 @@ def normalized(text):
     except Exception:
         pass
     # Characters that are not decomposed by NFKD.
-    text = (text.replace("ł", "l").replace("ø", "o").replace("đ", "d")
-                .replace("ð", "d").replace("þ", "th").replace("ı", "i"))
-    text = re.sub(r"[\t\r\n]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = (text.replace(u"ł", u"l").replace(u"ø", u"o").replace(u"đ", u"d")
+                .replace(u"ð", u"d").replace(u"þ", u"th").replace(u"ı", u"i"))
+    text = re.sub(r"\s+", u" ", text, flags=re.UNICODE).strip()
     return text
 
 
@@ -189,6 +203,11 @@ def contains_any(name, terms):
         if len(needle) <= 3 and re.match(r"^[a-z0-9]+$", needle):
             if re.search(r"(^|[^a-z0-9])%s($|[^a-z0-9])" % re.escape(needle), value):
                 return True, term
+        elif re.match(r"^[a-z0-9]", needle):
+            # Latin terms must start a word so "Sussex TV" does not hit
+            # "sex tv" and "Illustrated" does not hit "lust".
+            if re.search(r"(^|[^a-z0-9])%s" % re.escape(needle), value):
+                return True, term
         elif needle in value:
             return True, term
     return False, None
@@ -229,9 +248,20 @@ def all_tv_root():
     return eServiceReference(TV_SERVICE_ROOT)
 
 
+def is_marker_value(value):
+    # Markers (labels, numbered markers, spacers, hidden markers) all carry the
+    # 0x40 bit in the decimal flags field: "1:64:...", "1:320:...", "1:832:...".
+    parts = value.strip().split(":", 2)
+    if len(parts) < 3 or parts[0] != "1":
+        return False
+    try:
+        return (int(parts[1]) & 64) != 0
+    except ValueError:
+        return False
+
+
 def is_marker(ref):
-    value = ref_string(ref)
-    return value.startswith("1:64:") or value.startswith("1:832:")
+    return is_marker_value(ref_string(ref))
 
 
 def bouquet_filename_from_ref(ref):
@@ -246,21 +276,28 @@ def bouquet_filename_from_ref(ref):
 
 
 def marker_title_from_ref(ref, service_center=None):
+    """Visible marker text, or "" for untitled spacers."""
+    value = ref_string(ref)
     name = ""
     if service_center is not None:
-        name = service_name(service_center, ref)
-    value = ref_string(ref)
+        try:
+            info = service_center.info(ref)
+            if info:
+                name = info.getName(ref) or ""
+        except Exception:
+            name = ""
+    if name == value:
+        name = ""
     # Marker labels are commonly stored after a double colon.
-    if (not name or name == value) and "::" in value:
+    if not name and "::" in value:
         name = value.split("::", 1)[1]
-    return name or value
+    return name.strip()
 
 
 def is_marker_service_line(line):
     if not line.startswith("#SERVICE "):
         return False
-    value = line[len("#SERVICE "):].strip()
-    return value.startswith("1:64:") or value.startswith("1:832:")
+    return is_marker_value(line[len("#SERVICE "):])
 
 
 def marker_title_from_lines(lines, index):
@@ -277,28 +314,53 @@ def marker_title_from_lines(lines, index):
     return title
 
 
-def scan_adult_sections_file(path, bouquet_ref, bouquet_name, bouquet_words, whitelist):
-    sections = []
-    if not path or not os.path.isfile(path):
-        return sections
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            lines = handle.readlines()
-    except TypeError:
-        # Python 2 fallback for older Enigma2 images.
-        with open(path, "r") as handle:
-            lines = handle.readlines()
-    except Exception as err:
-        log("Could not read %s: %s" % (path, err))
-        return sections
+def read_bouquet_lines(path):
+    # newline="" keeps CRLF files intact and surrogateescape keeps non-UTF-8
+    # names byte-identical when the file is written back.
+    if PY3:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+            return handle.readlines()
+    with open(path, "rb") as handle:
+        return handle.readlines()
 
-    markers = [idx for idx, line in enumerate(lines) if is_marker_service_line(line)]
-    for pos, start in enumerate(markers):
-        end = markers[pos + 1] if pos + 1 < len(markers) else len(lines)
-        title = marker_title_from_lines(lines, start)
-        white, _ = contains_any(title, whitelist)
+
+def write_bouquet_lines(path, lines):
+    tmp = path + ".kidssafe.tmp"
+    try:
+        if PY3:
+            with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+                handle.writelines(lines)
+        else:
+            with open(tmp, "wb") as handle:
+                handle.writelines(lines)
+        os.rename(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def find_adult_sections(lines, bouquet_words, whitelist):
+    """Return (start, end, title, rule, service_refs) for every adult section.
+
+    A section starts at a titled marker and runs until the next titled marker.
+    Untitled spacers inside a section do not end it.
+    """
+    titled = []
+    for idx, line in enumerate(lines):
+        if is_marker_service_line(line):
+            title = marker_title_from_lines(lines, idx)
+            if title:
+                titled.append((idx, title))
+
+    found = []
+    for pos, (start, title) in enumerate(titled):
+        end = titled[pos + 1][0] if pos + 1 < len(titled) else len(lines)
+        is_white = contains_any(title, whitelist)[0]
         bad, matched = contains_any(title, bouquet_words)
-        if not bad or white:
+        if not bad or is_white:
             continue
         service_refs = []
         for line in lines[start:end]:
@@ -306,6 +368,21 @@ def scan_adult_sections_file(path, bouquet_ref, bouquet_name, bouquet_words, whi
                 raw_ref = line[len("#SERVICE "):].strip()
                 if raw_ref:
                     service_refs.append(raw_ref)
+        found.append((start, end, title, matched, service_refs))
+    return found
+
+
+def scan_adult_sections_file(path, bouquet_ref, bouquet_name, bouquet_words, whitelist):
+    sections = []
+    if not path or not os.path.isfile(path):
+        return sections
+    try:
+        lines = read_bouquet_lines(path)
+    except Exception as err:
+        log("Could not read %s: %s" % (path, err))
+        return sections
+
+    for start, end, title, matched, service_refs in find_adult_sections(lines, bouquet_words, whitelist):
         sections.append({
             "bouquet_ref": bouquet_ref,
             "bouquet_name": bouquet_name,
@@ -322,50 +399,33 @@ def scan_adult_sections_file(path, bouquet_ref, bouquet_name, bouquet_words, whi
 
 def remove_sections_from_files(sections, skip_bouquet_refs=None):
     skip_bouquet_refs = set(skip_bouquet_refs or [])
-    grouped = {}
+    paths = []
     for item in sections:
         if item.get("bouquet_ref") in skip_bouquet_refs:
             continue
-        grouped.setdefault(item["file"], []).append(item)
+        if item["file"] not in paths:
+            paths.append(item["file"])
 
+    bouquet_words, _channel_words, whitelist = build_rule_sets()
     removed_sections = 0
     removed_services = 0
     failures = []
-    for path, items in grouped.items():
+    for path in paths:
         try:
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-                    lines = handle.readlines()
-            except TypeError:
-                with open(path, "r") as handle:
-                    lines = handle.readlines()
-
-            # Delete from bottom to top so stored line ranges stay valid.
-            for item in sorted(items, key=lambda x: x["start"], reverse=True):
-                start = max(0, int(item["start"]))
-                end = min(len(lines), int(item["end"]))
-                if start >= end:
-                    continue
+            lines = read_bouquet_lines(path)
+            # Re-detect on the current file content instead of trusting line
+            # numbers from an earlier scan: the file may have changed since.
+            found = find_adult_sections(lines, bouquet_words, whitelist)
+            if not found:
+                continue
+            # Delete from bottom to top so line ranges stay valid.
+            for start, end, _title, _rule, service_refs in reversed(found):
                 del lines[start:end]
                 removed_sections += 1
-                removed_services += int(item.get("count", 0))
-
-            tmp = path + ".kidssafe.tmp"
-            try:
-                with open(tmp, "w", encoding="utf-8") as handle:
-                    handle.writelines(lines)
-            except TypeError:
-                with open(tmp, "w") as handle:
-                    handle.writelines(lines)
-            os.rename(tmp, path)
+                removed_services += len(service_refs)
+            write_bouquet_lines(path, lines)
         except Exception as err:
             failures.append("Section cleanup %s: %s" % (os.path.basename(path), err))
-            try:
-                tmp = path + ".kidssafe.tmp"
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-            except Exception:
-                pass
     return removed_sections, removed_services, failures
 
 
@@ -392,7 +452,7 @@ def scan_bouquets():
     for bref in bouquet_refs:
         bref_value = ref_string(bref)
         bname = service_name(service_center, bref)
-        white, _ = contains_any(bname, whitelist)
+        white = contains_any(bname, whitelist)[0]
         bad_bouquet, matched = contains_any(bname, bouquet_words)
 
         if bad_bouquet and not white:
@@ -411,7 +471,7 @@ def scan_bouquets():
             continue
 
         # V1.2: inspect marker/section headings in the actual userbouquet file.
-        # If a heading is adult/erotic, the whole block is removed up to the next marker.
+        # If a heading is adult/erotic, the whole block is removed up to the next titled marker.
         bpath = bouquet_filename_from_ref(bref)
         sections = scan_adult_sections_file(bpath, bref_value, bname, bouquet_words, whitelist)
         result["sections"].extend(sections)
@@ -428,15 +488,17 @@ def scan_bouquets():
         for sref in services or []:
             if is_marker(sref):
                 marker_name = marker_title_from_ref(sref, service_center)
-                mwhite, _ = contains_any(marker_name, whitelist)
-                mbad, _ = contains_any(marker_name, bouquet_words)
+                if not marker_name:
+                    # Untitled spacer: still part of the current section.
+                    continue
+                mwhite = contains_any(marker_name, whitelist)[0]
+                mbad = contains_any(marker_name, bouquet_words)[0]
                 in_bad_section = bool(mbad and not mwhite)
                 continue
             if in_bad_section:
                 continue
             sname = service_name(service_center, sref)
-            white, _ = contains_any(sname, whitelist)
-            if white:
+            if contains_any(sname, whitelist)[0]:
                 continue
             bad_channel, matched = contains_any(sname, channel_words)
             if bad_channel:
@@ -454,7 +516,7 @@ def scan_all_services():
     """Scan the same global TV service namespace used by Enigma2's All view."""
     service_center = eServiceCenter.getInstance()
     result = {"services": [], "errors": []}
-    _, channel_words, whitelist = build_rule_sets()
+    channel_words, whitelist = build_rule_sets()[1:]
     root = all_tv_root()
     try:
         listing = service_center.list(root)
@@ -468,8 +530,7 @@ def scan_all_services():
         if is_marker(sref):
             continue
         sname = service_name(service_center, sref)
-        white, _ = contains_any(sname, whitelist)
-        if white:
+        if contains_any(sname, whitelist)[0]:
             continue
         bad, matched = contains_any(sname, channel_words)
         if not bad:
@@ -560,13 +621,8 @@ def create_backup():
         os.makedirs(BACKUP_DIR)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     target = os.path.join(BACKUP_DIR, "kidssafe-%s.tar.gz" % stamp)
-    patterns = [
-        "bouquets.tv", "bouquets.radio", "userbouquet.*.tv", "userbouquet.*.radio",
-        "kidssafe_hidden_refs.txt",
-        "blacklist",
-    ]
     files = []
-    for pattern in patterns:
+    for pattern in BACKUP_PATTERNS:
         files.extend(glob.glob(os.path.join(ENIGMA2_DIR, pattern)))
     with tarfile.open(target, "w:gz") as archive:
         for path in sorted(set(files)):
@@ -611,10 +667,14 @@ def restore_backup(path):
         raise IOError("Backup not found")
     old_refs = read_terms(HIDDEN_REFS_FILE)
     remove_hidden_flags(old_refs)
+    restored = set()
     with tarfile.open(path, "r:gz") as archive:
         members = {os.path.basename(m.name): m for m in archive.getmembers() if m.isfile()}
         for name, member in members.items():
             if not name or name != member.name:
+                continue
+            # Only restore the kind of files create_backup() puts in the archive.
+            if not any(fnmatch.fnmatch(name, pattern) for pattern in BACKUP_PATTERNS):
                 continue
             source = archive.extractfile(member)
             if source is None:
@@ -622,8 +682,19 @@ def restore_backup(path):
             target = os.path.join(ENIGMA2_DIR, name)
             with open(target, "wb") as out:
                 out.write(source.read())
+            restored.add(name)
+    # The backup predates Strict Kids Mode: nothing was hidden at that time.
+    if os.path.basename(HIDDEN_REFS_FILE) not in restored and os.path.isfile(HIDDEN_REFS_FILE):
+        os.unlink(HIDDEN_REFS_FILE)
     eDVBDB.getInstance().reloadBouquets()
     apply_hidden_flags(read_terms(HIDDEN_REFS_FILE))
+    if "blacklist" in restored:
+        try:
+            # Reload so the in-memory list does not overwrite the restored file.
+            from Components.ParentalControl import parentalControl
+            parentalControl.open()
+        except Exception as err:
+            log("Could not reload parental-control lists: %s" % err)
 
 
 def protect_with_native_parental_control(compare_refs):
@@ -787,7 +858,7 @@ def format_scan(result, title="Preview"):
         lines.append("  [ALL] %s  (rule: %s)" % (item["service_name"], item["rule"]))
     if result["errors"]:
         lines.append("")
-        lines.append(_(_("Warnings:")))
+        lines.append(_("Warnings:"))
         for err in result["errors"]:
             lines.append("  - %s" % err)
     if not result["bouquets"] and not result.get("sections") and not result["channels"] and not result["global_services"]:
@@ -853,10 +924,10 @@ class KidsSafeSettings(Screen, ConfigListScreen):
 
 
 class KidsSafeMain(Screen):
-    skin = """
+    skin = ("""
         <screen name="KidsSafeMain" position="center,center" size="1200,650" title="KidsSafe Bouquets" backgroundColor="#06101B">
-            <ePixmap pixmap="/usr/lib/enigma2/python/Plugins/Extensions/KidsSafeBouquets/main_bg.png" position="0,0" size="1200,650" zPosition="-5" alphatest="blend" />
-            <ePixmap pixmap="/usr/lib/enigma2/python/Plugins/Extensions/KidsSafeBouquets/logo.png" position="28,24" size="150,112" alphatest="blend" />
+            <ePixmap pixmap="@PLUGIN_PATH@/main_bg.png" position="0,0" size="1200,650" zPosition="-5" alphatest="blend" />
+            <ePixmap pixmap="@PLUGIN_PATH@/logo.png" position="28,24" size="150,112" alphatest="blend" />
             <widget name="title" position="205,24" size="570,54" font="Regular;42" foregroundColor="#FFFFFF" transparent="1" />
             <widget name="subtitle" position="205,80" size="570,38" font="Regular;27" foregroundColor="#58AFFF" transparent="1" />
             <widget name="list" position="32,175" size="570,300" font="Regular;29" itemHeight="56" scrollbarMode="showNever" transparent="1" />
@@ -870,17 +941,19 @@ class KidsSafeMain(Screen):
             <widget source="key_yellow" render="Label" position="610,604" size="245,36" font="Regular;23" foregroundColor="#FFFFFF" transparent="1" />
             <widget source="key_blue" render="Label" position="895,604" size="245,36" font="Regular;23" foregroundColor="#FFFFFF" transparent="1" />
         </screen>
-    """
+    """).replace("@PLUGIN_PATH@", PLUGIN_PATH)
 
-    SCAN_WARNING = _(
-        "KidsSafe must scan all bouquets and, in Strict Kids Mode, the global TV service list.\n\n"
-        "Large settings can take some time and Enigma2 may react slowly during the scan. "
-        "Please wait until the scan finishes and do not restart the GUI.\n\nContinue?"
-    )
     def __init__(self, session):
         Screen.__init__(self, session)
         self.last_scan = None
         self.last_scan_fingerprint = None
+        self.pending = None
+        self.pendingTimer = eTimer()
+        try:
+            self.pendingTimer_conn = self.pendingTimer.timeout.connect(self.runPending)
+        except AttributeError:
+            self.pendingTimer.callback.append(self.runPending)
+        self.onClose.append(self.pendingTimer.stop)
         self["title"] = Label("KidsSafe Bouquets")
         self["subtitle"] = Label(_("A safer TV for your family"))
         self.menu = [
@@ -955,10 +1028,25 @@ class KidsSafeMain(Screen):
             self.showAbout()
 
     def askScanWarning(self, callback):
-        self.session.openWithCallback(callback, MessageBox, self.SCAN_WARNING, MessageBox.TYPE_YESNO, default=True)
+        message = _(
+            "KidsSafe must scan all bouquets and, in Strict Kids Mode, the global TV service list.\n\n"
+            "Large settings can take some time and Enigma2 may react slowly during the scan. "
+            "Please wait until the scan finishes and do not restart the GUI.\n\nContinue?"
+        )
+        self.session.openWithCallback(callback, MessageBox, message, MessageBox.TYPE_YESNO, default=True)
+
+    def runLater(self, status, func):
+        # Long work blocks the GUI; show the status text first, then run it.
+        self["status"].setText(status)
+        self.pending = func
+        self.pendingTimer.start(200, True)
+
+    def runPending(self):
+        func, self.pending = self.pending, None
+        if func is not None:
+            func()
 
     def doScan(self):
-        self["status"].setText(_("Scanning... please wait. Do not restart Enigma2."))
         result = scan_everything()
         self.last_scan = result
         self.last_scan_fingerprint = self.settingsFingerprint()
@@ -972,8 +1060,10 @@ class KidsSafeMain(Screen):
         self.askScanWarning(self.previewConfirmed)
 
     def previewConfirmed(self, answer):
-        if not answer:
-            return
+        if answer:
+            self.runLater(_("Scanning... please wait. Do not restart Enigma2."), self.previewScan)
+
+    def previewScan(self):
         try:
             result = self.doScan()
             self["status"].setText(_("Preview complete. GREEN Clean will reuse this scan."))
@@ -991,12 +1081,15 @@ class KidsSafeMain(Screen):
         self.askScanWarning(self.cleanScanConfirmed)
 
     def cleanScanConfirmed(self, answer):
-        if not answer:
-            return
+        if answer:
+            self.runLater(_("Scanning... please wait. Do not restart Enigma2."), self.cleanScan)
+
+    def cleanScan(self):
         try:
             result = self.doScan()
             self.confirmCleanFromResult(result)
         except Exception as err:
+            log("Scan failed: %s" % err)
             self["status"].setText(_("Scan failed."))
             self.session.open(MessageBox, _("Scan failed:\n%s") % err, MessageBox.TYPE_ERROR)
 
@@ -1014,11 +1107,12 @@ class KidsSafeMain(Screen):
         self.session.openWithCallback(lambda answer: self.cleanConfirmed(answer, result), MessageBox, message, MessageBox.TYPE_YESNO)
 
     def cleanConfirmed(self, answer, result):
-        if not answer:
-            return
+        if answer:
+            self.runLater(_("Cleaning... please wait."), lambda: self.doClean(result))
+
+    def doClean(self, result):
         backup = None
         try:
-            self["status"].setText(_("Cleaning... please wait."))
             if config.plugins.kidssafebouquets.make_backup.value:
                 backup = create_backup()
             rb, rs, rss, rc, hidden, protected, failures = apply_clean(result)
