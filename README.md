@@ -6,9 +6,11 @@ The plugin was created from a very practical problem: updated Enigma2 settings a
 
 ## Current version
 
-**v1.6**
+**v1.7**
 
-Designed for **OpenATV**, **OpenBH** and similar Enigma2 images.
+Designed for **OpenATV**, **OpenBH**, **OpenPLi**, **OpenSPA**, **EGAMI**, **VTi** and similar Enigma2 images (Python 2 and Python 3).
+
+Available in **LinuxSat Panel**.
 
 ## Why this plugin exists
 
@@ -57,17 +59,29 @@ Examples include:
 
 ## Installation
 
+### LinuxSat Panel
+
+Open **LinuxSat Panel → Utility Tools**, select **KidsSafe Bouquets** and install it. Restart the Enigma2 GUI when the installation finishes.
+
+### One-line install (telnet / SSH)
+
+```sh
+wget -q https://raw.githubusercontent.com/dorinelu/KidsSafeBouquets/main/installer.sh -O - | /bin/sh
+```
+
+Then restart the Enigma2 GUI.
+
 ### IPK
 
 Copy the package to `/tmp` on the receiver and install it with:
 
 ```sh
-opkg install /tmp/enigma2-plugin-extensions-kidssafebouquets_1.6-r0_all.ipk
+opkg install /tmp/enigma2-plugin-extensions-kidssafebouquets_1.7-r0_all.ipk
 ```
 
 Then restart the Enigma2 GUI.
 
-A fresh installation can install v1.6 directly. Earlier versions are not required.
+A fresh installation can install v1.7 directly. Earlier versions are not required.
 
 ### Manual source installation
 
@@ -134,11 +148,15 @@ Created for the Enigma2 community and for families who want current channel sett
 
 ## Interface languages
 
-KidsSafe Bouquets v1.6 adds a gettext-based multilingual interface. Initial UI languages:
+KidsSafe Bouquets uses a gettext-based interface (text domain `KidsSafeBouquets`).
 
-English, German, Romanian, Italian, Spanish, French, Dutch, Polish, Portuguese, Turkish, Russian and Arabic.
+Compiled translations are loaded from:
 
-The plugin follows the Enigma2 system language and falls back to English.
+```text
+/usr/lib/enigma2/python/Plugins/Extensions/KidsSafeBouquets/locale/<lang>/LC_MESSAGES/KidsSafeBouquets.mo
+```
+
+The plugin follows the Enigma2 system language and falls back to English when no translation is installed. Translation catalogues are not bundled yet; contributions are welcome.
 
 ## About / DG Labs
 
